@@ -138,9 +138,10 @@ def render_sidebar_defaults():
             st.sidebar.number_input(
                 "Random seed",
                 min_value=0,
-                max_value=999999,
+                max_value=2147483647,
                 value=20260309,
                 step=1,
+                help="Use any positive integer seed to reproduce the same fake dataset.",
             )
         ),
     }
