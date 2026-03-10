@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
-from firebase_client import batch_create, describe_auth_state, get_access_key, get_project_id
+from firebase_client import (
+    batch_create,
+    batch_delete,
+    describe_auth_state,
+    get_access_key,
+    get_project_id,
+    list_documents,
+)
 from generators import (
     generate_hackathons,
     generate_jobs,
@@ -18,6 +27,9 @@ st.set_page_config(
     page_icon="C",
     layout="wide",
 )
+
+
+MANAGED_COLLECTIONS = ["jobs", "hackathons", "teams", "projects"]
 
 
 def inject_styles():
@@ -116,10 +128,125 @@ def save_collection(collection_name: str, documents: list[dict]):
             st.code(error)
 
 
+def _new_batch_id() -> str:
+    return f"batch-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+
+def _ensure_batch_id() -> str:
+    if "admin_seed_batch_id" not in st.session_state:
+        st.session_state["admin_seed_batch_id"] = _new_batch_id()
+    return str(st.session_state["admin_seed_batch_id"])
+
+
+def _normalize_text(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_true(value) -> bool:
+    return value is True or _normalize_text(value) in {"true", "1", "yes"}
+
+
+def _matches_legacy_generated_record(collection_name: str, document: dict) -> bool:
+    description = _normalize_text(document.get("description"))
+    if collection_name == "jobs":
+        return _normalize_text(document.get("source")) == "seed_admin_panel" or (
+            "this is seeded demo data for the admin panel." in description
+        )
+    if collection_name == "hackathons":
+        return description.startswith(
+            "seeded hackathon for the flutter candidate experience."
+        )
+    if collection_name == "teams":
+        return (
+            description
+            == "demo team for talent collaboration, prototyping, and hackathon prep."
+        )
+    if collection_name == "projects":
+        return "is seeded demo data for portfolio and project discovery screens." in description
+    return False
+
+
+def _document_label(collection_name: str, document: dict) -> str:
+    field_map = {
+        "jobs": "jobTitle",
+        "hackathons": "name",
+        "teams": "teamName",
+        "projects": "title",
+    }
+    return str(document.get(field_map.get(collection_name, ""), "")).strip() or document.get(
+        "doc_id", "Untitled"
+    )
+
+
+def _find_cleanup_candidates(
+    batch_id: str | None,
+    include_legacy: bool,
+) -> list[dict]:
+    rows: list[dict] = []
+    for collection_name in MANAGED_COLLECTIONS:
+        try:
+            documents = list_documents(collection_name, page_size=200, max_documents=1000)
+        except Exception as exc:
+            rows.append(
+                {
+                    "collection": collection_name,
+                    "doc_id": "",
+                    "doc_path": "",
+                    "label": f"Read failed: {exc}",
+                    "match_type": "error",
+                    "created_at": "",
+                }
+            )
+            continue
+
+        for document in documents:
+            is_managed = _is_true(document.get("_adminSeed"))
+            batch_matches = not batch_id or document.get("_adminSeedBatchId") == batch_id
+
+            if is_managed and batch_matches:
+                rows.append(
+                    {
+                        "collection": collection_name,
+                        "doc_id": document.get("doc_id", ""),
+                        "doc_path": document.get("doc_path", ""),
+                        "label": _document_label(collection_name, document),
+                        "match_type": "batch" if batch_id else "managed",
+                        "created_at": document.get("_adminSeedCreatedAt", ""),
+                    }
+                )
+                continue
+
+            if include_legacy and not batch_id and _matches_legacy_generated_record(
+                collection_name, document
+            ):
+                rows.append(
+                    {
+                        "collection": collection_name,
+                        "doc_id": document.get("doc_id", ""),
+                        "doc_path": document.get("doc_path", ""),
+                        "label": _document_label(collection_name, document),
+                        "match_type": "legacy",
+                        "created_at": document.get("createdAt")
+                        or document.get("timestamp")
+                        or document.get("postedAt")
+                        or "",
+                    }
+                )
+
+    return [row for row in rows if row.get("match_type") != "error"] + [
+        row for row in rows if row.get("match_type") == "error"
+    ]
+
+
 def render_sidebar_defaults():
     st.sidebar.markdown("## Seed Controls")
     st.sidebar.caption(f"Firebase project: `{get_project_id()}`")
     st.sidebar.caption(f"Auth state: {describe_auth_state()}")
+    st.sidebar.text_input("Current batch ID", value=_ensure_batch_id(), disabled=True)
+    if st.sidebar.button("Start New Batch", use_container_width=True):
+        st.session_state["admin_seed_batch_id"] = _new_batch_id()
+        st.rerun()
+    st.sidebar.caption("Generated records carry hidden metadata so this panel can safely clean them up later.")
 
     defaults = {
         "company_name": st.sidebar.text_input("Company name", value="Candiatescr Labs"),
@@ -141,9 +268,10 @@ def render_sidebar_defaults():
                 max_value=2147483647,
                 value=20260309,
                 step=1,
-                help="Use any positive integer seed to reproduce the same fake dataset.",
+                help="Use any positive integer seed to reproduce the same dataset again.",
             )
         ),
+        "batch_id": _ensure_batch_id(),
     }
     return defaults
 
@@ -157,6 +285,7 @@ def render_jobs_tab(defaults: dict):
         hr_id=defaults["hr_id"],
         hr_email=defaults["hr_email"],
         org_id=defaults["org_id"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 1,
     )
     show_preview(
@@ -181,6 +310,7 @@ def render_hackathons_tab(defaults: dict):
         count=count,
         company_name=defaults["company_name"],
         company_id=defaults["company_id"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 2,
     )
     show_preview(
@@ -208,6 +338,7 @@ def render_teams_tab(defaults: dict):
         count=count,
         creator_ids=defaults["user_ids"],
         hackathon_names=hackathon_names,
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 3,
     )
     show_preview(
@@ -231,6 +362,7 @@ def render_projects_tab(defaults: dict):
     project_docs = generate_projects(
         count=count,
         user_ids=defaults["user_ids"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 4,
     )
     show_preview(
@@ -258,6 +390,7 @@ def render_full_pack_tab(defaults: dict):
         count=hack_count,
         company_name=defaults["company_name"],
         company_id=defaults["company_id"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 10,
     )
     hackathon_names = [doc["name"] for doc in hack_docs]
@@ -267,17 +400,20 @@ def render_full_pack_tab(defaults: dict):
         hr_id=defaults["hr_id"],
         hr_email=defaults["hr_email"],
         org_id=defaults["org_id"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 11,
     )
     team_docs = generate_teams(
         count=team_count,
         creator_ids=defaults["user_ids"],
         hackathon_names=hackathon_names,
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 12,
     )
     project_docs = generate_projects(
         count=project_count,
         user_ids=defaults["user_ids"],
+        seed_batch_id=defaults["batch_id"],
         seed=defaults["seed"] + 13,
     )
 
@@ -297,6 +433,83 @@ def render_full_pack_tab(defaults: dict):
         save_collection("projects", project_docs)
 
 
+def render_cleanup_tab(defaults: dict):
+    st.subheader("Cleanup Studio")
+    st.caption(
+        "Delete only records created by this panel. Original data is excluded unless it matches the exact legacy fingerprints from the older generator."
+    )
+
+    scope = st.radio(
+        "Cleanup scope",
+        ["Current batch only", "All admin-created records"],
+        horizontal=True,
+        help="Current batch is the safest option. The all-records option also catches older panel records written before hidden metadata was added.",
+    )
+    include_legacy = scope == "All admin-created records"
+    scoped_batch_id = defaults["batch_id"] if scope == "Current batch only" else None
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("Scan Deletable Records", key="scan_cleanup"):
+            st.session_state["cleanup_records"] = _find_cleanup_candidates(
+                batch_id=scoped_batch_id,
+                include_legacy=include_legacy,
+            )
+            st.session_state["cleanup_scope"] = scope
+    with col2:
+        if scope == "Current batch only":
+            st.caption(f"Current batch: `{defaults['batch_id']}`")
+        else:
+            st.caption(
+                "Includes hidden managed records plus exact legacy fingerprints from the previous generator."
+            )
+
+    rows = st.session_state.get("cleanup_records", [])
+    if st.session_state.get("cleanup_scope") != scope:
+        rows = []
+
+    if not rows:
+        st.info("Run a scan to preview which documents are eligible for deletion.")
+        return
+
+    error_rows = [row for row in rows if row.get("match_type") == "error"]
+    preview_rows = [row for row in rows if row.get("match_type") != "error"]
+
+    if preview_rows:
+        preview_frame = pd.DataFrame(preview_rows)
+        st.dataframe(
+            preview_frame[
+                ["collection", "doc_id", "label", "match_type", "created_at"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(f"Records queued for deletion: {len(preview_rows)}")
+
+        if st.button(
+            "Delete Previewed Records",
+            key="delete_cleanup",
+            type="primary",
+        ):
+            deleted_count, errors = batch_delete(
+                [row["doc_path"] for row in preview_rows if row.get("doc_path")]
+            )
+            if deleted_count:
+                st.success(f"Deleted {deleted_count} generated records.")
+            if errors:
+                st.error(f"{len(errors)} deletes failed.")
+                for error in errors[:3]:
+                    st.code(error)
+            st.session_state["cleanup_records"] = []
+    else:
+        st.success("No generated records matched the selected cleanup scope.")
+
+    if error_rows:
+        st.warning(f"{len(error_rows)} collections could not be scanned.")
+        for row in error_rows[:3]:
+            st.code(row["label"])
+
+
 def main():
     inject_styles()
     require_access()
@@ -307,9 +520,9 @@ def main():
         <div class="hero">
             <h1>Candiatescr Admin Data Studio</h1>
             <p>
-                Standalone Streamlit panel for seeding the Flutter Firebase project with
-                jobs, hackathons, teams, and projects. Use this when you want the
-                app to feel populated during demos, QA, or design reviews.
+                Standalone Streamlit panel for generating production-style sample data in the
+                Flutter Firebase project across jobs, hackathons, teams, and projects.
+                Generated records carry hidden metadata so they can be safely cleaned up later.
             </p>
         </div>
         """,
@@ -331,7 +544,7 @@ def main():
     )
 
     st.markdown("")
-    tabs = st.tabs(["Jobs", "Hackathons", "Teams", "Projects", "Full Pack"])
+    tabs = st.tabs(["Jobs", "Hackathons", "Teams", "Projects", "Full Pack", "Cleanup"])
     with tabs[0]:
         render_jobs_tab(defaults)
     with tabs[1]:
@@ -342,6 +555,8 @@ def main():
         render_projects_tab(defaults)
     with tabs[4]:
         render_full_pack_tab(defaults)
+    with tabs[5]:
+        render_cleanup_tab(defaults)
 
     with st.expander("Setup notes"):
         st.markdown(

@@ -155,6 +155,46 @@ def to_firestore_document(data: dict) -> dict:
     return {"fields": {key: _python_to_firestore_value(value) for key, value in data.items()}}
 
 
+def _firestore_to_python_value(value: dict):
+    if "nullValue" in value:
+        return None
+    if "booleanValue" in value:
+        return bool(value["booleanValue"])
+    if "integerValue" in value:
+        return int(value["integerValue"])
+    if "doubleValue" in value:
+        return float(value["doubleValue"])
+    if "timestampValue" in value:
+        return str(value["timestampValue"])
+    if "stringValue" in value:
+        return str(value["stringValue"])
+    if "mapValue" in value:
+        fields = value.get("mapValue", {}).get("fields", {})
+        return {
+            key: _firestore_to_python_value(child_value)
+            for key, child_value in fields.items()
+        }
+    if "arrayValue" in value:
+        values = value.get("arrayValue", {}).get("values", [])
+        return [_firestore_to_python_value(item) for item in values]
+    return value
+
+
+def from_firestore_document(document: dict) -> dict:
+    full_name = str(document.get("name", ""))
+    doc_id = full_name.split("/")[-1] if full_name else ""
+    doc_path = full_name.split("/documents/", 1)[-1] if "/documents/" in full_name else ""
+    fields = document.get("fields", {})
+    parsed = {
+        key: _firestore_to_python_value(value)
+        for key, value in fields.items()
+    }
+    parsed["doc_id"] = doc_id
+    parsed["doc_path"] = doc_path
+    parsed["_document_name"] = full_name
+    return parsed
+
+
 def add_document(collection_path: str, data: dict, doc_id: str = None) -> str:
     base_url = get_rest_root()
     api_key = get_web_api_key()
@@ -189,3 +229,68 @@ def batch_create(collection_path: str, documents: list[dict]) -> tuple[list[str]
         except Exception as exc:
             errors.append(str(exc))
     return saved_ids, errors
+
+
+def list_documents(
+    collection_path: str,
+    page_size: int = 200,
+    max_documents: int = 1000,
+) -> list[dict]:
+    base_url = get_rest_root()
+    api_key = get_web_api_key()
+    headers = firestore_headers()
+    url = f"{base_url}/documents/{collection_path}"
+    documents: list[dict] = []
+    page_token = ""
+
+    while len(documents) < max_documents:
+        params = {
+            "key": api_key,
+            "pageSize": min(page_size, max_documents - len(documents)),
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Firestore read failed for {collection_path} "
+                f"({response.status_code}): {response.text}"
+            )
+
+        payload = response.json()
+        page_documents = payload.get("documents", []) or []
+        documents.extend(from_firestore_document(document) for document in page_documents)
+        page_token = str(payload.get("nextPageToken", "")).strip()
+        if not page_token or not page_documents:
+            break
+
+    return documents
+
+
+def delete_document(document_path: str) -> None:
+    if not document_path:
+        raise ValueError("document_path is required for delete")
+
+    base_url = get_rest_root()
+    api_key = get_web_api_key()
+    headers = firestore_headers()
+    url = f"{base_url}/documents/{document_path}?key={api_key}"
+    response = requests.delete(url, headers=headers, timeout=20)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Firestore delete failed for {document_path} "
+            f"({response.status_code}): {response.text}"
+        )
+
+
+def batch_delete(document_paths: list[str]) -> tuple[int, list[str]]:
+    deleted_count = 0
+    errors = []
+    for document_path in document_paths:
+        try:
+            delete_document(document_path)
+            deleted_count += 1
+        except Exception as exc:
+            errors.append(str(exc))
+    return deleted_count, errors

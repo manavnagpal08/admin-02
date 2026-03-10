@@ -80,6 +80,16 @@ TEAM_ROLES = [
     "Mobile Builder",
 ]
 
+TEAM_NAMES = [
+    "Northstar Collective",
+    "Vertex Builders",
+    "Signal Forge",
+    "Launchpad Studio",
+    "Orbit Makers",
+    "BluePeak Labs",
+    "CloudSprint Team",
+]
+
 PROJECT_TOPICS = [
     "AI Resume Copilot",
     "Hackathon Team Matcher",
@@ -101,6 +111,14 @@ ASSET_SEEDS = [
     "atlas",
 ]
 
+REPO_OWNERS = [
+    "novagrid-labs",
+    "orbitstack-dev",
+    "brightforge-tech",
+    "signalnest-labs",
+    "coreharbor-team",
+]
+
 
 def _rng(seed: int | None) -> random.Random:
     return random.Random(seed)
@@ -119,6 +137,16 @@ def _asset_url(seed: str, width: int = 1200, height: int = 600) -> str:
     return f"https://picsum.photos/seed/{seed}/{width}/{height}"
 
 
+def _admin_seed_metadata(collection_name: str, seed_batch_id: str | None) -> dict:
+    return {
+        "_adminSeed": True,
+        "_adminSeedVersion": 2,
+        "_adminSeedCollection": collection_name,
+        "_adminSeedBatchId": seed_batch_id or f"admin-seed-{uuid.uuid4().hex[:10]}",
+        "_adminSeedCreatedAt": datetime.utcnow(),
+    }
+
+
 def parse_user_ids(raw_value: str) -> list[str]:
     values = []
     for piece in raw_value.replace("\n", ",").split(","):
@@ -134,6 +162,7 @@ def generate_jobs(
     hr_id: str,
     hr_email: str,
     org_id: str,
+    seed_batch_id: str | None = None,
     seed: int | None = None,
 ) -> list[dict]:
     rnd = _rng(seed)
@@ -153,9 +182,10 @@ def generate_jobs(
                 "companyName": effective_company,
                 "location": rnd.choice(LOCATIONS),
                 "description": (
-                    f"{title} role focused on shipping fast, scalable product features. "
-                    f"Primary stack includes {', '.join(requirements[:3])}. "
-                    "This is seeded demo data for the admin panel."
+                    f"Join the {effective_company} team as a {title} to ship high-impact product "
+                    f"experiences across web and mobile platforms. You will work with "
+                    f"{', '.join(requirements[:3])} and collaborate with cross-functional teams "
+                    "to deliver reliable, scalable features."
                 ),
                 "requirements": requirements,
                 "jobType": rnd.choice(JOB_TYPES),
@@ -172,7 +202,7 @@ def generate_jobs(
                 "targetProjectId": None,
                 "qualifications": qualifications,
                 "orgId": org_id or "seed-org",
-                "source": "seed_admin_panel",
+                **_admin_seed_metadata("jobs", seed_batch_id),
             }
         )
     return jobs
@@ -182,6 +212,7 @@ def generate_hackathons(
     count: int,
     company_name: str,
     company_id: str,
+    seed_batch_id: str | None = None,
     seed: int | None = None,
 ) -> list[dict]:
     rnd = _rng(seed)
@@ -223,8 +254,9 @@ def generate_hackathons(
                 "name": rnd.choice(HACKATHON_NAMES),
                 "companyName": effective_company,
                 "description": (
-                    "Seeded hackathon for the Flutter candidate experience. "
-                    f"Focus areas: {', '.join(skills[:4])}."
+                    f"{effective_company} is inviting builders to design and launch solutions around "
+                    f"{', '.join(skills[:4])}. Teams will move from concept to demo-ready delivery "
+                    "with mentor reviews, milestone checkpoints, and final judging."
                 ),
                 "startDate": start_date,
                 "endDate": end_date,
@@ -242,6 +274,7 @@ def generate_hackathons(
                 "bannerUrl": _asset_url(f"{doc_id}_banner", 1600, 700),
                 "currentPhase": "Build",
                 "phases": phases,
+                **_admin_seed_metadata("hackathons", seed_batch_id),
             }
         )
     return hackathons
@@ -251,6 +284,7 @@ def generate_teams(
     count: int,
     creator_ids: list[str],
     hackathon_names: list[str] | None = None,
+    seed_batch_id: str | None = None,
     seed: int | None = None,
 ) -> list[dict]:
     rnd = _rng(seed)
@@ -277,15 +311,17 @@ def generate_teams(
         teams.append(
             {
                 "doc_id": _doc_id("team"),
-                "teamName": f"Build Crew {index + 1}",
+                "teamName": f"{rnd.choice(TEAM_NAMES)} {index + 1}",
                 "description": (
-                    "Demo team for talent collaboration, prototyping, and hackathon prep."
+                    "Cross-functional product team focused on collaboration, rapid prototyping, "
+                    "and polished final submissions."
                 ),
                 "hackathonName": rnd.choice(hackathon_names) if hackathon_names else None,
                 "creatorId": creator_id,
                 "requiredRoles": required_roles,
                 "members": members,
                 "createdAt": datetime.utcnow().isoformat(),
+                **_admin_seed_metadata("teams", seed_batch_id),
             }
         )
     return teams
@@ -294,24 +330,27 @@ def generate_teams(
 def generate_projects(
     count: int,
     user_ids: list[str],
+    seed_batch_id: str | None = None,
     seed: int | None = None,
 ) -> list[dict]:
     rnd = _rng(seed)
     projects = []
     for _ in range(count):
         title = rnd.choice(PROJECT_TOPICS)
+        project_slug = title.lower().replace(" ", "-")
         projects.append(
             {
                 "doc_id": _doc_id("project"),
                 "userId": rnd.choice(user_ids),
                 "title": title,
                 "description": (
-                    f"{title} is seeded demo data for portfolio and project discovery screens. "
-                    "It includes enough content to make the UI feel populated."
+                    f"{title} is a portfolio-ready build focused on practical product execution, "
+                    "clean implementation, and measurable user impact."
                 ),
-                "projectLink": f"https://github.com/demo/{title.lower().replace(' ', '-')}",
+                "projectLink": f"https://github.com/{rnd.choice(REPO_OWNERS)}/{project_slug}",
                 "status": rnd.choice(PROJECT_STATUSES),
                 "timestamp": datetime.utcnow() - timedelta(days=rnd.randint(0, 120)),
+                **_admin_seed_metadata("projects", seed_batch_id),
             }
         )
     return projects
