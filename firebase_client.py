@@ -268,6 +268,30 @@ def list_documents(
     return documents
 
 
+def get_document(collection_path: str, doc_id: str) -> dict:
+    if not collection_path or not doc_id:
+        raise ValueError("collection_path and doc_id are required")
+
+    base_url = get_rest_root()
+    api_key = get_web_api_key()
+    headers = firestore_headers()
+    url = f"{base_url}/documents/{collection_path}/{doc_id}"
+    response = requests.get(url, params={"key": api_key}, headers=headers, timeout=20)
+
+    if response.status_code == 404:
+        return {}
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Firestore read failed for {collection_path}/{doc_id} "
+            f"({response.status_code}): {response.text}"
+        )
+    return from_firestore_document(response.json())
+
+
+def upsert_document(collection_path: str, doc_id: str, data: dict) -> str:
+    return add_document(collection_path, data, doc_id=doc_id)
+
+
 def delete_document(document_path: str) -> None:
     if not document_path:
         raise ValueError("document_path is required for delete")
