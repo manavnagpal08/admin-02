@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+import os
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from firebase_client import (
@@ -45,6 +47,62 @@ ANALYTICS_COLLECTION_LIMITS = {
 }
 DIGEST_CONFIG_DOC = "daily_digest"
 DIGEST_ROLE_OPTIONS = ["candidate", "student", "hr", "recruiter", "mentor", "admin"]
+
+
+def _secret_or_env(key: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(key, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.environ.get(key, default).strip()
+
+
+def _digest_backend_url() -> str:
+    explicit_url = _secret_or_env("DIGEST_BACKEND_URL")
+    if explicit_url:
+        return explicit_url
+
+    base_url = _secret_or_env(
+        "RENDER_EMAIL_BACKEND_URL",
+        default="https://backend-x8j1.onrender.com",
+    )
+    if base_url.endswith("/send-daily-digest"):
+        return base_url
+    return f"{base_url.rstrip('/')}/send-daily-digest"
+
+
+def _render_email_base_url() -> str:
+    explicit_url = _secret_or_env("RENDER_EMAIL_BACKEND_URL")
+    if explicit_url:
+        return explicit_url.rstrip("/")
+
+    digest_url = _secret_or_env("DIGEST_BACKEND_URL")
+    if digest_url.endswith("/send-daily-digest"):
+        return digest_url[: -len("/send-daily-digest")]
+    if digest_url:
+        return digest_url.rstrip("/")
+
+    return "https://backend-x8j1.onrender.com"
+
+
+def _trigger_render_digest() -> dict:
+    response = requests.post(
+        _digest_backend_url(),
+        json={"triggered_by": "streamlit_super_admin"},
+        timeout=180,
+    )
+    try:
+        payload = response.json() if response.content else {}
+    except ValueError:
+        payload = {}
+    if response.status_code == 404:
+        raise LookupError("Render digest endpoint /send-daily-digest is not deployed yet.")
+    if response.status_code != 200:
+        message = payload.get("message") or payload.get("detail") or response.text
+        raise RuntimeError(f"Render digest trigger failed: {message}")
+    return payload if isinstance(payload, dict) else {"status": "success"}
 
 
 def inject_styles():
@@ -303,6 +361,11 @@ def _load_super_admin_data() -> dict:
     except Exception as exc:
         payload["digest_config"] = {}
         errors["system_config/daily_digest"] = str(exc)
+    try:
+        payload["digest_runs"] = list_documents("digest_runs", page_size=25, max_documents=25)
+    except Exception as exc:
+        payload["digest_runs"] = []
+        errors["digest_runs"] = str(exc)
     payload["errors"] = errors
     return payload
 
@@ -599,6 +662,8 @@ def _default_digest_config() -> dict:
         "introText": "Fresh roles, hackathons, and curated suggestions from Candiatescr.",
         "jobsUrl": "https://candiatescr.web.app/#/jobs",
         "hackathonsUrl": "https://candiatescr.web.app/#/hackathons",
+        "deliveryProvider": "render_backend",
+        "deliveryTimezone": "Asia/Kolkata",
         "updatedBy": "streamlit_super_admin",
     }
 
@@ -1042,10 +1107,16 @@ def render_bulk_notifications_tab(data: dict):
 def render_digest_tab(data: dict):
     st.subheader("Daily Opportunity Digest")
     st.caption(
-        "This config powers the scheduled Cloud Function `sendDailyOpportunityDigest`, which sends daily email digests for jobs and hackathons."
+        "This config powers the Render email backend endpoint `/send-daily-digest`. You can call it from a Render cron job or trigger it manually below."
     )
 
     config = {**_default_digest_config(), **(data.get("digest_config") or {})}
+    digest_runs = sorted(
+        data.get("digest_runs", []),
+        key=lambda row: str(row.get("doc_id", "")),
+        reverse=True,
+    )
+    latest_run = digest_runs[0] if digest_runs else {}
     users = data.get("users", [])
     jobs = _active_jobs(data.get("jobs", []))
     hackathons = _active_hackathons(data.get("hackathons", []))
@@ -1134,9 +1205,21 @@ def render_digest_tab(data: dict):
     d1.metric("Digest recipients", len(digest_recipients))
     d2.metric("Jobs in queue", len([row for row in preview_rows if row["Type"] == "Job"]))
     d3.metric("Hackathons in queue", len([row for row in preview_rows if row["Type"] == "Hackathon"]))
-    d4.metric("Status", "Enabled" if enabled else "Disabled")
+    d4.metric("Last run", str(latest_run.get("status", "not_run")).replace("_", " ").title())
 
-    if st.button("Save Digest Configuration", type="primary", use_container_width=True):
+    if latest_run:
+        latest_finished = _format_dt(
+            _first_datetime(latest_run, "finishedAt", "startedAt")
+        )
+        st.caption(
+            f"Latest digest run: {latest_run.get('status', 'unknown')} | "
+            f"sent {latest_run.get('sentCount', 0)} of "
+            f"{latest_run.get('totalRecipients', 0)} recipients | "
+            f"{latest_finished}"
+        )
+
+    action1, action2 = st.columns(2)
+    if action1.button("Save Digest Configuration", type="primary", use_container_width=True):
         payload = {
             "enabled": enabled,
             "audienceRoles": audience_roles,
@@ -1149,6 +1232,8 @@ def render_digest_tab(data: dict):
             "introText": intro_text.strip() or _default_digest_config()["introText"],
             "jobsUrl": jobs_url.strip() or _default_digest_config()["jobsUrl"],
             "hackathonsUrl": hackathons_url.strip() or _default_digest_config()["hackathonsUrl"],
+            "deliveryProvider": "render_backend",
+            "deliveryTimezone": "Asia/Kolkata",
             "updatedAt": datetime.utcnow(),
             "updatedBy": "streamlit_super_admin",
         }
@@ -1168,6 +1253,23 @@ def render_digest_tab(data: dict):
         )
         clear_admin_cache()
         st.success("Daily digest configuration saved.")
+
+    if action2.button("Trigger Digest Now", use_container_width=True):
+        try:
+            response = _trigger_render_digest()
+            clear_admin_cache()
+            status = str(response.get("status", "success"))
+            if status == "skipped":
+                reason = str(response.get("reason", "skipped")).replace("_", " ")
+                st.warning(f"Digest not sent: {reason}.")
+            else:
+                st.success(
+                    "Render digest triggered. "
+                    f"Sent {response.get('sentCount', 0)} of "
+                    f"{response.get('totalRecipients', response.get('recipientCount', 0))} recipients."
+                )
+        except Exception as exc:
+            st.error(str(exc))
 
     st.markdown("### Digest Audience Preview")
     if digest_recipients:
@@ -1194,7 +1296,7 @@ def render_digest_tab(data: dict):
         st.info("No jobs or hackathons currently match the digest filters.")
 
     st.markdown(
-        '<p class="small-note">Recommended automation window: daily at 08:00 Asia/Kolkata. Users are excluded automatically when `digestOptOut` is true.</p>',
+        '<p class="small-note">Recommended automation window: daily at 08:00 Asia/Kolkata. Users are excluded automatically when `digestOptOut` is true, and delivery is now expected to run from the Render backend.</p>',
         unsafe_allow_html=True,
     )
 
@@ -1458,7 +1560,7 @@ def main():
         unsafe_allow_html=True,
     )
     stat2.markdown(
-        '<div class="mini-card"><h3>WRITE MODE</h3><strong>Firestore REST + Cloud Functions</strong></div>',
+        '<div class="mini-card"><h3>WRITE MODE</h3><strong>Firestore REST + Render Backend</strong></div>',
         unsafe_allow_html=True,
     )
     stat3.markdown(
@@ -1516,9 +1618,10 @@ def main():
             - `FLUTTER_FIREBASE_ID_TOKEN` or `CANDIATESCR_FIREBASE_ID_TOKEN`
             - or `FLUTTER_SYNC_EMAIL` + `FLUTTER_SYNC_PASSWORD`
             - optional `CANDIATESCR_FIREBASE_WEB_API_KEY`
+            - optional `RENDER_EMAIL_BACKEND_URL` or `DIGEST_BACKEND_URL`
 
-            Daily digest automation reads `system_config/daily_digest` and is executed by the
-            Firebase Cloud Function `sendDailyOpportunityDigest`.
+            Daily digest automation reads `system_config/daily_digest` and is sent by the
+            Render email backend endpoint `/send-daily-digest`.
             """
         )
 
