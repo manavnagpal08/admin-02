@@ -23,6 +23,9 @@ Use Streamlit secrets or environment variables:
 - `FLUTTER_FIREBASE_ID_TOKEN` or `CANDIATESCR_FIREBASE_ID_TOKEN`
 - or `FLUTTER_SYNC_EMAIL` and `FLUTTER_SYNC_PASSWORD`
 - optional `CANDIATESCR_FIREBASE_WEB_API_KEY`
+- optional `GMAIL_ADDRESS` or `GMAIL_EMAIL`, and `GMAIL_APP_PASSWORD`
+- or `SMTP_EMAIL` and `SMTP_PASSWORD`
+- or `EMAIL_USER` and `EMAIL_PASS`
 
 ## Files
 

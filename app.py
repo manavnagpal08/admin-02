@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from email.message import EmailMessage
 import os
+import smtplib
 
 import pandas as pd
-import requests
 import streamlit as st
 
 from firebase_client import (
@@ -47,6 +48,20 @@ ANALYTICS_COLLECTION_LIMITS = {
 }
 DIGEST_CONFIG_DOC = "daily_digest"
 DIGEST_ROLE_OPTIONS = ["candidate", "student", "hr", "recruiter", "mentor", "admin"]
+SMTP_EMAIL_KEYS = (
+    "ADMIN_GMAIL_EMAIL",
+    "GMAIL_ADDRESS",
+    "GMAIL_EMAIL",
+    "SMTP_EMAIL",
+    "EMAIL_USER",
+)
+SMTP_PASSWORD_KEYS = (
+    "ADMIN_GMAIL_PASSWORD",
+    "GMAIL_APP_PASSWORD",
+    "GMAIL_PASSWORD",
+    "SMTP_PASSWORD",
+    "EMAIL_PASS",
+)
 
 
 def _secret_or_env(key: str, default: str = "") -> str:
@@ -59,50 +74,50 @@ def _secret_or_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
-def _digest_backend_url() -> str:
-    explicit_url = _secret_or_env("DIGEST_BACKEND_URL")
-    if explicit_url:
-        return explicit_url
+def _first_secret_or_env(keys: tuple[str, ...], default: str = "") -> str:
+    for key in keys:
+        value = _secret_or_env(key)
+        if value:
+            return value
+    return default.strip()
 
-    base_url = _secret_or_env(
-        "RENDER_EMAIL_BACKEND_URL",
-        default="https://backend-x8j1.onrender.com",
+
+def _smtp_sender_email() -> str:
+    session_value = str(st.session_state.get("admin_mail_sender_email") or "").strip()
+    if session_value:
+        return session_value
+    return _first_secret_or_env(SMTP_EMAIL_KEYS)
+
+
+def _smtp_sender_password() -> str:
+    session_value = str(st.session_state.get("admin_mail_sender_password") or "").strip()
+    if session_value:
+        return session_value
+    return _first_secret_or_env(SMTP_PASSWORD_KEYS)
+
+
+def _smtp_from_name() -> str:
+    return (
+        _secret_or_env("SMTP_FROM_NAME")
+        or _secret_or_env("MAIL_FROM_NAME")
+        or "Candiatescr Opportunities"
     )
-    if base_url.endswith("/send-daily-digest"):
-        return base_url
-    return f"{base_url.rstrip('/')}/send-daily-digest"
 
 
-def _render_email_base_url() -> str:
-    explicit_url = _secret_or_env("RENDER_EMAIL_BACKEND_URL")
-    if explicit_url:
-        return explicit_url.rstrip("/")
-
-    digest_url = _secret_or_env("DIGEST_BACKEND_URL")
-    if digest_url.endswith("/send-daily-digest"):
-        return digest_url[: -len("/send-daily-digest")]
-    if digest_url:
-        return digest_url.rstrip("/")
-
-    return "https://backend-x8j1.onrender.com"
+def _digest_delivery_provider() -> str:
+    return "streamlit_gmail_smtp"
 
 
-def _trigger_render_digest() -> dict:
-    response = requests.post(
-        _digest_backend_url(),
-        json={"triggered_by": "streamlit_super_admin"},
-        timeout=180,
+def _require_smtp_credentials() -> tuple[str, str]:
+    sender_email = _smtp_sender_email()
+    sender_password = _smtp_sender_password()
+    if sender_email and sender_password:
+        return sender_email, sender_password
+    raise RuntimeError(
+        "Gmail sender email and password are required. Set `GMAIL_ADDRESS` or "
+        "`GMAIL_EMAIL`, plus `GMAIL_APP_PASSWORD`, in Streamlit secrets/environment, "
+        "or enter them in the Daily Digest tab."
     )
-    try:
-        payload = response.json() if response.content else {}
-    except ValueError:
-        payload = {}
-    if response.status_code == 404:
-        raise LookupError("Render digest endpoint /send-daily-digest is not deployed yet.")
-    if response.status_code != 200:
-        message = payload.get("message") or payload.get("detail") or response.text
-        raise RuntimeError(f"Render digest trigger failed: {message}")
-    return payload if isinstance(payload, dict) else {"status": "success"}
 
 
 def inject_styles():
@@ -203,6 +218,23 @@ def show_preview(title: str, records: list[dict], preferred_columns: list[str]):
 def clear_admin_cache():
     load_collection_cached.clear()
     load_document_cached.clear()
+
+
+def _best_effort_upsert(collection_name: str, doc_id: str, payload: dict) -> str | None:
+    try:
+        return upsert_document(collection_name, doc_id, payload)
+    except Exception:
+        return None
+
+
+def _best_effort_batch_create(collection_name: str, documents: list[dict]) -> list[str]:
+    if not documents:
+        return []
+    try:
+        _, errors = batch_create(collection_name, documents)
+        return errors
+    except Exception as exc:
+        return [str(exc)]
 
 
 def save_collection(collection_name: str, documents: list[dict]):
@@ -662,7 +694,7 @@ def _default_digest_config() -> dict:
         "introText": "Fresh roles, hackathons, and curated suggestions from Candiatescr.",
         "jobsUrl": "https://candiatescr.web.app/#/jobs",
         "hackathonsUrl": "https://candiatescr.web.app/#/hackathons",
-        "deliveryProvider": "render_backend",
+        "deliveryProvider": _digest_delivery_provider(),
         "deliveryTimezone": "Asia/Kolkata",
         "updatedBy": "streamlit_super_admin",
     }
@@ -730,6 +762,288 @@ def _digest_opportunity_rows(
                 }
             )
     return response
+
+
+def _digest_opportunity_docs(
+    rows: list[dict],
+    date_fields: list[str],
+    lookback_days: int,
+    max_items: int,
+) -> list[dict]:
+    threshold = datetime.now(LOCAL_TZ) - timedelta(days=lookback_days)
+    prepared = []
+    for row in rows:
+        event_at = _first_datetime(row, *date_fields)
+        if event_at and event_at < threshold:
+            continue
+        prepared.append((event_at or datetime.now(LOCAL_TZ), row))
+    prepared.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in prepared[:max_items]]
+
+
+def _build_digest_subject_local(
+    config: dict,
+    jobs: list[dict],
+    hackathons: list[dict],
+) -> str:
+    prefix = str(config.get("subjectPrefix") or "Daily Opportunity Digest").strip()
+    parts = []
+    if jobs:
+        parts.append(f"{len(jobs)} jobs")
+    if hackathons:
+        parts.append(f"{len(hackathons)} hackathons")
+    return f"{prefix} | {' & '.join(parts)}" if parts else prefix
+
+
+def _build_digest_text_local(
+    recipient: dict,
+    config: dict,
+    jobs: list[dict],
+    hackathons: list[dict],
+) -> str:
+    first_name = str(recipient.get("name") or "there").strip().split(" ")[0]
+    lines = [
+        f"Hello {first_name},",
+        "",
+        str(config.get("introText") or _default_digest_config()["introText"]).strip(),
+        "",
+    ]
+    if jobs:
+        lines.append("Latest Jobs:")
+        for job in jobs:
+            title = str(job.get("jobTitle") or job.get("title") or job.get("doc_id") or "Untitled Job").strip()
+            company = str(job.get("companyName") or job.get("company") or "Candiatescr").strip()
+            lines.append(f"- {title} | {company}")
+        lines.append(f"Browse jobs: {str(config.get('jobsUrl') or _default_digest_config()['jobsUrl']).strip()}")
+        lines.append("")
+    if hackathons:
+        lines.append("Live Hackathons:")
+        for hackathon in hackathons:
+            title = str(hackathon.get("name") or hackathon.get("title") or hackathon.get("doc_id") or "Untitled Hackathon").strip()
+            company = str(hackathon.get("companyName") or hackathon.get("company") or "Candiatescr").strip()
+            lines.append(f"- {title} | {company}")
+        lines.append(
+            "Browse hackathons: "
+            f"{str(config.get('hackathonsUrl') or _default_digest_config()['hackathonsUrl']).strip()}"
+        )
+        lines.append("")
+    lines.extend(["See you in the platform,", "The Candiatescr Team"])
+    return "\n".join(lines)
+
+
+def _build_digest_html_local(
+    recipient: dict,
+    config: dict,
+    jobs: list[dict],
+    hackathons: list[dict],
+) -> str:
+    first_name = str(recipient.get("name") or "there").strip().split(" ")[0]
+    intro_text = str(config.get("introText") or _default_digest_config()["introText"]).strip()
+    jobs_url = str(config.get("jobsUrl") or _default_digest_config()["jobsUrl"]).strip()
+    hackathons_url = str(config.get("hackathonsUrl") or _default_digest_config()["hackathonsUrl"]).strip()
+
+    def render_items(items: list[dict], kind: str) -> str:
+        rows = []
+        for item in items:
+            title = (
+                str(item.get("jobTitle") or item.get("title") or item.get("doc_id") or "Untitled Job").strip()
+                if kind == "job"
+                else str(item.get("name") or item.get("title") or item.get("doc_id") or "Untitled Hackathon").strip()
+            )
+            company = str(item.get("companyName") or item.get("company") or "Candiatescr").strip()
+            rows.append(
+                f"<li style='margin-bottom:8px;'><strong>{title}</strong><br><span style='color:#475569;'>{company}</span></li>"
+            )
+        return "".join(rows)
+
+    jobs_block = (
+        f"""
+        <h3 style="margin:24px 0 10px 0;color:#0f172a;">Latest Jobs</h3>
+        <ul style="padding-left:18px;margin:0;">{render_items(jobs, "job")}</ul>
+        <p style="margin-top:12px;"><a href="{jobs_url}" style="color:#0f172a;font-weight:700;">Browse all jobs</a></p>
+        """
+        if jobs
+        else ""
+    )
+    hackathons_block = (
+        f"""
+        <h3 style="margin:24px 0 10px 0;color:#0f172a;">Live Hackathons</h3>
+        <ul style="padding-left:18px;margin:0;">{render_items(hackathons, "hackathon")}</ul>
+        <p style="margin-top:12px;"><a href="{hackathons_url}" style="color:#0f172a;font-weight:700;">Browse all hackathons</a></p>
+        """
+        if hackathons
+        else ""
+    )
+
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif;">
+        <div style="max-width:680px;margin:24px auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 8px 30px rgba(15,23,42,0.12);">
+          <div style="background:linear-gradient(135deg,#0f172a,#0ea5e9);padding:28px 24px;color:#ffffff;">
+            <div style="font-size:12px;letter-spacing:1.1px;font-weight:700;opacity:0.85;">CANDIATESCR DAILY DIGEST</div>
+            <h2 style="margin:10px 0 0 0;">Fresh opportunities for {first_name}</h2>
+            <p style="margin:10px 0 0 0;opacity:0.92;">{intro_text}</p>
+          </div>
+          <div style="padding:24px;color:#1f2937;line-height:1.6;">
+            {jobs_block}
+            {hackathons_block}
+          </div>
+          <div style="background:#f8fafc;padding:14px 24px;font-size:12px;color:#6b7280;">
+            You are receiving this because your Candiatescr digest is enabled.
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+
+def _send_custom_email_via_gmail(
+    to_email: str,
+    subject: str,
+    body: str,
+    html_body: str,
+) -> None:
+    sender_email, sender_password = _require_smtp_credentials()
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = f"{_smtp_from_name()} <{sender_email}>"
+    message["To"] = to_email
+    message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=45) as server:
+        server.login(sender_email, sender_password)
+        server.send_message(message)
+
+
+def _run_streamlit_digest_delivery(
+    config: dict,
+    recipients: list[dict],
+    jobs: list[dict],
+    hackathons: list[dict],
+) -> dict:
+    run_key = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    started_at = datetime.utcnow()
+    audit_errors: list[str] = []
+
+    if not jobs and not hackathons:
+        if not _best_effort_upsert(
+            "digest_runs",
+            run_key,
+            {
+                "status": "skipped",
+                "reason": "no_content",
+                "finishedAt": datetime.utcnow(),
+                "triggeredBy": "streamlit_super_admin",
+                "deliveryProvider": _digest_delivery_provider(),
+            },
+        ):
+            audit_errors.append("Could not write digest_runs audit record.")
+        return {
+            "status": "skipped",
+            "reason": "no_content",
+            "runKey": run_key,
+            "auditErrors": audit_errors,
+        }
+
+    if not recipients:
+        if not _best_effort_upsert(
+            "digest_runs",
+            run_key,
+            {
+                "status": "skipped",
+                "reason": "no_recipients",
+                "finishedAt": datetime.utcnow(),
+                "triggeredBy": "streamlit_super_admin",
+                "deliveryProvider": _digest_delivery_provider(),
+            },
+        ):
+            audit_errors.append("Could not write digest_runs audit record.")
+        return {
+            "status": "skipped",
+            "reason": "no_recipients",
+            "runKey": run_key,
+            "auditErrors": audit_errors,
+        }
+
+    if not _best_effort_upsert(
+        "digest_runs",
+        run_key,
+        {
+            "status": "running",
+            "startedAt": started_at,
+            "triggeredBy": "streamlit_super_admin",
+            "deliveryProvider": _digest_delivery_provider(),
+        },
+    ):
+        audit_errors.append("Could not write digest_runs running status.")
+
+    subject = _build_digest_subject_local(config, jobs, hackathons)
+    sent_count = 0
+    failures = []
+    for recipient in recipients:
+        email = str(recipient.get("email") or "").strip()
+        if not email:
+            continue
+        try:
+            _send_custom_email_via_gmail(
+                to_email=email,
+                subject=subject,
+                body=_build_digest_text_local(recipient, config, jobs, hackathons),
+                html_body=_build_digest_html_local(recipient, config, jobs, hackathons),
+            )
+            sent_count += 1
+        except Exception as exc:
+            failures.append({"email": email, "error": str(exc)})
+
+    finished_at = datetime.utcnow()
+    status = "completed" if not failures else "completed_with_errors"
+    if not _best_effort_upsert(
+        "digest_runs",
+        run_key,
+        {
+            "status": status,
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "triggeredBy": "streamlit_super_admin",
+            "deliveryProvider": _digest_delivery_provider(),
+            "totalRecipients": len(recipients),
+            "sentCount": sent_count,
+            "failedCount": len(failures),
+            "jobsIncluded": len(jobs),
+            "hackathonsIncluded": len(hackathons),
+            "sampleErrors": failures[:20],
+        },
+    ):
+        audit_errors.append("Could not write digest_runs completion status.")
+    audit_errors.extend(
+        _best_effort_batch_create(
+            "notifications",
+            [
+                {
+                    "title": "Daily digest dispatched",
+                    "message": (
+                        f"Sent {sent_count} daily digests with {len(jobs)} jobs and "
+                        f"{len(hackathons)} hackathons via Streamlit Gmail SMTP."
+                    ),
+                    "timestamp": finished_at,
+                    "type": "digest_job",
+                    "recipientCount": sent_count,
+                    "deliveryProvider": _digest_delivery_provider(),
+                }
+            ],
+        )
+    )
+    return {
+        "status": status,
+        "runKey": run_key,
+        "totalRecipients": len(recipients),
+        "sentCount": sent_count,
+        "failedCount": len(failures),
+        "auditErrors": audit_errors,
+    }
 
 
 def _find_cleanup_candidates(
@@ -1107,7 +1421,7 @@ def render_bulk_notifications_tab(data: dict):
 def render_digest_tab(data: dict):
     st.subheader("Daily Opportunity Digest")
     st.caption(
-        "This config powers the Render email backend endpoint `/send-daily-digest`. You can call it from a Render cron job or trigger it manually below."
+        "This digest sends directly from the Streamlit admin panel through Gmail SMTP. Use a Gmail sender ID and password or app password below."
     )
 
     config = {**_default_digest_config(), **(data.get("digest_config") or {})}
@@ -1117,9 +1431,16 @@ def render_digest_tab(data: dict):
         reverse=True,
     )
     latest_run = digest_runs[0] if digest_runs else {}
+    load_errors = data.get("errors", {})
     users = data.get("users", [])
     jobs = _active_jobs(data.get("jobs", []))
     hackathons = _active_hackathons(data.get("hackathons", []))
+
+    if load_errors.get("digest_runs"):
+        st.info(
+            "Firestore blocked reading `digest_runs`, so Last run history may be incomplete. "
+            "Email sending can still work."
+        )
 
     enabled = st.checkbox("Enable daily digest", value=_is_true(config.get("enabled")))
     audience_roles = st.multiselect(
@@ -1178,22 +1499,66 @@ def render_digest_tab(data: dict):
         value=str(config.get("hackathonsUrl", _default_digest_config()["hackathonsUrl"])),
     )
 
+    st.markdown("### Sender Credentials")
+    sender_col, password_col = st.columns(2)
+    sender_col.text_input(
+        "Gmail sender ID",
+        value=_smtp_sender_email(),
+        key="admin_mail_sender_email",
+        help="This Gmail account sends the digest directly from Streamlit.",
+    )
+    password_col.text_input(
+        "Gmail password / app password",
+        value=_smtp_sender_password(),
+        key="admin_mail_sender_password",
+        type="password",
+        help="Use a Gmail app password if Google blocks direct password sign-in.",
+    )
+    if _smtp_sender_email() and _smtp_sender_password():
+        st.caption(
+            f"Direct delivery is ready. Sender: `{_smtp_sender_email()}` via Gmail SMTP."
+        )
+    else:
+        st.warning(
+            "Enter a Gmail sender email and password to send digest emails from this admin panel."
+        )
+
     digest_recipients = _digest_candidates(users, audience_roles)
+    digest_jobs = (
+        _digest_opportunity_docs(
+            jobs,
+            ["postedAt", "createdAt", "timestamp"],
+            job_lookback_days,
+            max_items,
+        )
+        if include_jobs
+        else []
+    )
+    digest_hackathons = (
+        _digest_opportunity_docs(
+            hackathons,
+            ["createdAt", "registrationDeadline", "deadline", "startDate"],
+            hackathon_lookback_days,
+            max_items,
+        )
+        if include_hackathons
+        else []
+    )
     preview_rows: list[dict] = []
-    if include_jobs:
+    if digest_jobs:
         preview_rows.extend(
             _digest_opportunity_rows(
-                jobs,
+                digest_jobs,
                 ["postedAt", "createdAt", "timestamp"],
                 job_lookback_days,
                 max_items,
                 "job",
             )
         )
-    if include_hackathons:
+    if digest_hackathons:
         preview_rows.extend(
             _digest_opportunity_rows(
-                hackathons,
+                digest_hackathons,
                 ["createdAt", "registrationDeadline", "deadline", "startDate"],
                 hackathon_lookback_days,
                 max_items,
@@ -1232,7 +1597,7 @@ def render_digest_tab(data: dict):
             "introText": intro_text.strip() or _default_digest_config()["introText"],
             "jobsUrl": jobs_url.strip() or _default_digest_config()["jobsUrl"],
             "hackathonsUrl": hackathons_url.strip() or _default_digest_config()["hackathonsUrl"],
-            "deliveryProvider": "render_backend",
+            "deliveryProvider": _digest_delivery_provider(),
             "deliveryTimezone": "Asia/Kolkata",
             "updatedAt": datetime.utcnow(),
             "updatedBy": "streamlit_super_admin",
@@ -1254,9 +1619,28 @@ def render_digest_tab(data: dict):
         clear_admin_cache()
         st.success("Daily digest configuration saved.")
 
-    if action2.button("Trigger Digest Now", use_container_width=True):
+    if action2.button("Send Digest Now", use_container_width=True):
         try:
-            response = _trigger_render_digest()
+            response = _run_streamlit_digest_delivery(
+                config={
+                    **config,
+                    "enabled": enabled,
+                    "audienceRoles": audience_roles,
+                    "includeJobs": include_jobs,
+                    "includeHackathons": include_hackathons,
+                    "maxItems": max_items,
+                    "jobLookbackDays": job_lookback_days,
+                    "hackathonLookbackDays": hackathon_lookback_days,
+                    "subjectPrefix": subject_prefix.strip() or "Daily Opportunity Digest",
+                    "introText": intro_text.strip() or _default_digest_config()["introText"],
+                    "jobsUrl": jobs_url.strip() or _default_digest_config()["jobsUrl"],
+                    "hackathonsUrl": hackathons_url.strip() or _default_digest_config()["hackathonsUrl"],
+                    "deliveryProvider": _digest_delivery_provider(),
+                },
+                recipients=digest_recipients,
+                jobs=digest_jobs,
+                hackathons=digest_hackathons,
+            )
             clear_admin_cache()
             status = str(response.get("status", "success"))
             if status == "skipped":
@@ -1264,12 +1648,18 @@ def render_digest_tab(data: dict):
                 st.warning(f"Digest not sent: {reason}.")
             else:
                 st.success(
-                    "Render digest triggered. "
+                    "Digest sent directly from Streamlit. "
                     f"Sent {response.get('sentCount', 0)} of "
                     f"{response.get('totalRecipients', response.get('recipientCount', 0))} recipients."
                 )
+            audit_errors = response.get("auditErrors", [])
+            if audit_errors:
+                st.warning(
+                    "Email delivery finished, but some Firestore audit writes failed: "
+                    + " | ".join(str(error) for error in audit_errors[:3])
+                )
         except Exception as exc:
-            st.error(str(exc))
+            st.error(f"Digest send failed: {exc}")
 
     st.markdown("### Digest Audience Preview")
     if digest_recipients:
@@ -1296,7 +1686,7 @@ def render_digest_tab(data: dict):
         st.info("No jobs or hackathons currently match the digest filters.")
 
     st.markdown(
-        '<p class="small-note">Recommended automation window: daily at 08:00 Asia/Kolkata. Users are excluded automatically when `digestOptOut` is true, and delivery is now expected to run from the Render backend.</p>',
+        '<p class="small-note">Recommended send window: daily at 08:00 Asia/Kolkata. Users are excluded automatically when `digestOptOut` is true, and delivery now runs directly from this Streamlit app via Gmail SMTP.</p>',
         unsafe_allow_html=True,
     )
 
@@ -1560,7 +1950,7 @@ def main():
         unsafe_allow_html=True,
     )
     stat2.markdown(
-        '<div class="mini-card"><h3>WRITE MODE</h3><strong>Firestore REST + Render Backend</strong></div>',
+        '<div class="mini-card"><h3>WRITE MODE</h3><strong>Firestore REST + Gmail SMTP</strong></div>',
         unsafe_allow_html=True,
     )
     stat3.markdown(
@@ -1618,10 +2008,12 @@ def main():
             - `FLUTTER_FIREBASE_ID_TOKEN` or `CANDIATESCR_FIREBASE_ID_TOKEN`
             - or `FLUTTER_SYNC_EMAIL` + `FLUTTER_SYNC_PASSWORD`
             - optional `CANDIATESCR_FIREBASE_WEB_API_KEY`
-            - optional `RENDER_EMAIL_BACKEND_URL` or `DIGEST_BACKEND_URL`
+            - optional `GMAIL_ADDRESS` or `GMAIL_EMAIL`, plus `GMAIL_APP_PASSWORD`
+            - or `SMTP_EMAIL` + `SMTP_PASSWORD`
+            - or `EMAIL_USER` + `EMAIL_PASS`
 
-            Daily digest automation reads `system_config/daily_digest` and is sent by the
-            Render email backend endpoint `/send-daily-digest`.
+            The Daily Digest tab sends mail directly from Streamlit through Gmail SMTP.
+            For Gmail, use an app password if normal password login is blocked.
             """
         )
 
