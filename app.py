@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
+from html import escape
 import os
 import smtplib
 
@@ -837,61 +838,307 @@ def _build_digest_html_local(
     jobs: list[dict],
     hackathons: list[dict],
 ) -> str:
-    first_name = str(recipient.get("name") or "there").strip().split(" ")[0]
-    intro_text = str(config.get("introText") or _default_digest_config()["introText"]).strip()
-    jobs_url = str(config.get("jobsUrl") or _default_digest_config()["jobsUrl"]).strip()
-    hackathons_url = str(config.get("hackathonsUrl") or _default_digest_config()["hackathonsUrl"]).strip()
+    first_name = escape(str(recipient.get("name") or "there").strip().split(" ")[0])
+    intro_text = escape(
+        str(config.get("introText") or _default_digest_config()["introText"]).strip()
+    )
+    jobs_url = escape(
+        str(config.get("jobsUrl") or _default_digest_config()["jobsUrl"]).strip(),
+        quote=True,
+    )
+    hackathons_url = escape(
+        str(config.get("hackathonsUrl") or _default_digest_config()["hackathonsUrl"]).strip(),
+        quote=True,
+    )
+    digest_date = datetime.now(LOCAL_TZ).strftime("%d %b %Y")
 
-    def render_items(items: list[dict], kind: str) -> str:
-        rows = []
+    def _safe_text(value, fallback: str) -> str:
+        clean = str(value or "").strip()
+        return escape(clean or fallback)
+
+    def _safe_meta(value) -> str:
+        clean = str(value or "").strip()
+        return escape(clean) if clean else ""
+
+    def _job_meta(item: dict) -> list[str]:
+        meta = [
+            _safe_meta(item.get("location")),
+            _safe_meta(item.get("experienceLevel") or item.get("employmentType")),
+            _safe_meta(item.get("salary") or item.get("salaryRange")),
+            _safe_meta(item.get("deadline")),
+        ]
+        return [entry for entry in meta if entry]
+
+    def _hackathon_meta(item: dict) -> list[str]:
+        team_min = str(item.get("teamSizeMin") or "").strip()
+        team_max = str(item.get("teamSizeMax") or "").strip()
+        team_size = ""
+        if team_min and team_max:
+            team_size = f"Team size {team_min}-{team_max}"
+        elif team_min:
+            team_size = f"Team size {team_min}+"
+        meta = [
+            _safe_meta(item.get("registrationDeadline") or item.get("deadline")),
+            _safe_meta(item.get("prize")),
+            escape(team_size) if team_size else "",
+            _safe_meta(item.get("mode") or item.get("location")),
+        ]
+        return [entry for entry in meta if entry]
+
+    def _meta_pills(values: list[str]) -> str:
+        if not values:
+            return ""
+        pills = []
+        for value in values[:4]:
+            pills.append(
+                f"""
+                <span style="display:inline-block;margin:0 8px 8px 0;padding:7px 11px;
+                background:#eef6ff;border:1px solid #d7e8fb;border-radius:999px;
+                color:#23415f;font-size:12px;line-height:1.2;font-weight:600;">
+                  {value}
+                </span>
+                """
+            )
+        return "".join(pills)
+
+    def _render_cards(items: list[dict], kind: str) -> str:
+        cards = []
+        accent = "#0ea5e9" if kind == "job" else "#f97316"
+        label = "JOB PICK" if kind == "job" else "HACKATHON PICK"
         for item in items:
             title = (
-                str(item.get("jobTitle") or item.get("title") or item.get("doc_id") or "Untitled Job").strip()
+                _safe_text(
+                    item.get("jobTitle") or item.get("title") or item.get("doc_id"),
+                    "Untitled Job",
+                )
                 if kind == "job"
-                else str(item.get("name") or item.get("title") or item.get("doc_id") or "Untitled Hackathon").strip()
+                else _safe_text(
+                    item.get("name") or item.get("title") or item.get("doc_id"),
+                    "Untitled Hackathon",
+                )
             )
-            company = str(item.get("companyName") or item.get("company") or "Candiatescr").strip()
-            rows.append(
-                f"<li style='margin-bottom:8px;'><strong>{title}</strong><br><span style='color:#475569;'>{company}</span></li>"
+            company = _safe_text(
+                item.get("companyName") or item.get("company"),
+                "Candiatescr",
             )
-        return "".join(rows)
+            raw_summary = str(
+                item.get("description")
+                or item.get("summary")
+                or item.get("roleSummary")
+                or item.get("tagline")
+                or ""
+            ).strip()
+            meta_html = _meta_pills(_job_meta(item) if kind == "job" else _hackathon_meta(item))
+            summary_html = (
+                f"""
+                <tr>
+                  <td style="padding:0 26px 10px 26px;color:#526071;font-size:14px;line-height:1.7;">
+                    {escape(raw_summary[:220])}{"..." if len(raw_summary) > 220 else ""}
+                  </td>
+                </tr>
+                """
+                if raw_summary
+                else ""
+            )
+            cards.append(
+                f"""
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                  style="margin:0 0 16px 0;background:#ffffff;border:1px solid #dbe7f3;border-radius:18px;">
+                  <tr>
+                    <td style="padding:0;">
+                      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td style="padding:22px 26px 8px 26px;">
+                            <div style="font-size:11px;line-height:1;letter-spacing:1.4px;font-weight:800;color:{accent};">
+                              {label}
+                            </div>
+                          </td>
+                        </tr>
+                        <tr>
+                          <td style="padding:0 26px 6px 26px;color:#14263d;font-size:24px;line-height:1.25;font-weight:800;">
+                            {title}
+                          </td>
+                        </tr>
+                        <tr>
+                          <td style="padding:0 26px 12px 26px;color:#5f6f82;font-size:15px;line-height:1.5;font-weight:600;">
+                            {company}
+                          </td>
+                        </tr>
+                        <tr>
+                          <td style="padding:0 26px 4px 26px;">
+                            {meta_html}
+                          </td>
+                        </tr>
+                        {summary_html}
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+                """
+            )
+        return "".join(cards)
 
     jobs_block = (
         f"""
-        <h3 style="margin:24px 0 10px 0;color:#0f172a;">Latest Jobs</h3>
-        <ul style="padding-left:18px;margin:0;">{render_items(jobs, "job")}</ul>
-        <p style="margin-top:12px;"><a href="{jobs_url}" style="color:#0f172a;font-weight:700;">Browse all jobs</a></p>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 18px 0;">
+          <tr>
+            <td style="padding:0 0 14px 0;color:#14263d;font-size:22px;line-height:1.2;font-weight:800;">
+              Top jobs for you
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 0 16px 0;color:#5c6d80;font-size:14px;line-height:1.6;">
+              Curated roles selected from the latest openings in the network.
+            </td>
+          </tr>
+          <tr>
+            <td>{_render_cards(jobs, "job")}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0 0 0;">
+              <a href="{jobs_url}" style="display:inline-block;padding:13px 20px;background:#14263d;color:#ffffff;
+              text-decoration:none;border-radius:999px;font-size:14px;font-weight:700;">Explore all jobs</a>
+            </td>
+          </tr>
+        </table>
         """
         if jobs
         else ""
     )
     hackathons_block = (
         f"""
-        <h3 style="margin:24px 0 10px 0;color:#0f172a;">Live Hackathons</h3>
-        <ul style="padding-left:18px;margin:0;">{render_items(hackathons, "hackathon")}</ul>
-        <p style="margin-top:12px;"><a href="{hackathons_url}" style="color:#0f172a;font-weight:700;">Browse all hackathons</a></p>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0;">
+          <tr>
+            <td style="padding:8px 0 14px 0;color:#14263d;font-size:22px;line-height:1.2;font-weight:800;">
+              Live hackathons worth entering
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 0 16px 0;color:#5c6d80;font-size:14px;line-height:1.6;">
+              Build, compete, and get noticed in active challenges across the platform.
+            </td>
+          </tr>
+          <tr>
+            <td>{_render_cards(hackathons, "hackathon")}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0 0 0;">
+              <a href="{hackathons_url}" style="display:inline-block;padding:13px 20px;background:#f97316;color:#ffffff;
+              text-decoration:none;border-radius:999px;font-size:14px;font-weight:700;">See all hackathons</a>
+            </td>
+          </tr>
+        </table>
         """
         if hackathons
         else ""
     )
+    quick_stats = f"""
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td width="33.33%" style="padding:14px 12px;background:#f6fbff;border:1px solid #dcecf9;border-radius:16px;text-align:center;">
+            <div style="color:#5d7287;font-size:11px;letter-spacing:1.2px;font-weight:800;">JOBS</div>
+            <div style="margin-top:6px;color:#14263d;font-size:30px;line-height:1;font-weight:800;">{len(jobs)}</div>
+          </td>
+          <td width="16" style="font-size:0;line-height:0;">&nbsp;</td>
+          <td width="33.33%" style="padding:14px 12px;background:#fff7f1;border:1px solid #ffe2cf;border-radius:16px;text-align:center;">
+            <div style="color:#9a5320;font-size:11px;letter-spacing:1.2px;font-weight:800;">HACKATHONS</div>
+            <div style="margin-top:6px;color:#14263d;font-size:30px;line-height:1;font-weight:800;">{len(hackathons)}</div>
+          </td>
+          <td width="16" style="font-size:0;line-height:0;">&nbsp;</td>
+          <td width="33.33%" style="padding:14px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:16px;text-align:center;">
+            <div style="color:#5d7287;font-size:11px;letter-spacing:1.2px;font-weight:800;">DIGEST DATE</div>
+            <div style="margin-top:9px;color:#14263d;font-size:16px;line-height:1.2;font-weight:800;">{escape(digest_date)}</div>
+          </td>
+        </tr>
+      </table>
+    """
 
     return f"""
     <html>
-      <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif;">
-        <div style="max-width:680px;margin:24px auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 8px 30px rgba(15,23,42,0.12);">
-          <div style="background:linear-gradient(135deg,#0f172a,#0ea5e9);padding:28px 24px;color:#ffffff;">
-            <div style="font-size:12px;letter-spacing:1.1px;font-weight:700;opacity:0.85;">CANDIATESCR DAILY DIGEST</div>
-            <h2 style="margin:10px 0 0 0;">Fresh opportunities for {first_name}</h2>
-            <p style="margin:10px 0 0 0;opacity:0.92;">{intro_text}</p>
-          </div>
-          <div style="padding:24px;color:#1f2937;line-height:1.6;">
-            {jobs_block}
-            {hackathons_block}
-          </div>
-          <div style="background:#f8fafc;padding:14px 24px;font-size:12px;color:#6b7280;">
-            You are receiving this because your Candiatescr digest is enabled.
-          </div>
-        </div>
+      <body style="margin:0;padding:0;background:#e9f0f6;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#e9f0f6;margin:0;padding:24px 0;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:720px;margin:0 auto;">
+                <tr>
+                  <td style="padding:0 16px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                      style="background:#12263f;border-radius:28px 28px 0 0;">
+                      <tr>
+                        <td style="padding:18px 26px 0 26px;">
+                          <div style="display:inline-block;padding:8px 12px;background:#ffffff14;border:1px solid #ffffff2e;
+                          border-radius:999px;color:#d9eafc;font-size:11px;line-height:1;letter-spacing:1.4px;font-weight:800;">
+                            CANDIATESCR DAILY DIGEST
+                          </div>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:18px 26px 10px 26px;color:#ffffff;font-size:38px;line-height:1.08;font-weight:800;">
+                          Fresh opportunities, picked for {first_name}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 26px 22px 26px;color:#d4e4f4;font-size:16px;line-height:1.7;">
+                          {intro_text}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 26px 28px 26px;">
+                          <a href="{jobs_url}" style="display:inline-block;padding:14px 20px;background:#ffffff;color:#12263f;
+                          text-decoration:none;border-radius:999px;font-size:14px;font-weight:800;margin-right:10px;">
+                            Open jobs
+                          </a>
+                          <a href="{hackathons_url}" style="display:inline-block;padding:14px 20px;background:#f97316;color:#ffffff;
+                          text-decoration:none;border-radius:999px;font-size:14px;font-weight:800;">
+                            Open hackathons
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                      style="background:#ffffff;border-radius:0 0 28px 28px;overflow:hidden;">
+                      <tr>
+                        <td style="padding:26px;">
+                          {quick_stats}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 26px 4px 26px;color:#6a7c90;font-size:13px;line-height:1.7;">
+                          Your shortlist is generated from recently active opportunities that match the current digest filters.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:20px 26px 26px 26px;">
+                          {jobs_block}
+                          {hackathons_block}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 26px 26px 26px;">
+                          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                            style="background:#f8fbfd;border:1px solid #dbe7f3;border-radius:20px;">
+                            <tr>
+                              <td style="padding:18px 20px;color:#5d6c7d;font-size:13px;line-height:1.7;">
+                                You are receiving this email because your Candiatescr digest is enabled.
+                                Visit the platform anytime to view the latest updates and manage your preferences.
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 26px 30px 26px;color:#7b8794;font-size:12px;line-height:1.7;text-align:center;">
+                          Sent by Candiatescr Opportunities
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
       </body>
     </html>
     """
